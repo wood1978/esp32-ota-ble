@@ -7,7 +7,7 @@ esp32 OTA through BLE  with Siliconlabs EFR Connect App
  Siliconlabs的efr connect app支持ota功能，因此通过抓包Siliconlabs efr connect app的ota过程后按其实现相应service 以及char 后就可以直接用efr connect来进行ble ota升级，省去了自己实现 ble ota client的工作。
  
  ## 开发前提
-  * esp32，该项目在Mini KIT ESP32板上实测
+  * esp32，该项目在MH-ET LIVE MiniKit for ESP32板上实测(https://doc.riot-os.org/group__boards__esp32__mh-et-live-minikit.html)
   * esp32的sdk idf v5.2
   * 手机app Siliconlabs efr connect（efr connect ota只支持传输.gbl的固件形式，因此待升级的esp32的bin文件直接将.bin后缀改为.gbl后就可以使用）
   
