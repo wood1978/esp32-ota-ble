@@ -1,14 +1,14 @@
 # esp32_ota_ble
 esp32 OTA through BLE  with Siliconlabs EFR Connect App
 
-# 基于esp32c3的蓝牙无线升级功能
- esp32的idf已经提供了ota参考代码，参考代码基于http，esp32c3除了支持wifi 还支持ble，因此也有不少需要通过ble进行ota升级的需求
+# 基于esp32的蓝牙无线升级功能
+ esp32的idf已经提供了ota参考代码，参考代码基于http，esp32除了支持wifi 还支持ble，因此也有不少需要通过ble进行ota升级的需求
  
  Siliconlabs的efr connect app支持ota功能，因此通过抓包Siliconlabs efr connect app的ota过程后按其实现相应service 以及char 后就可以直接用efr connect来进行ble ota升级，省去了自己实现 ble ota client的工作。
  
  ## 开发前提
-  * esp32c3，该项目在esp32-c3-devkitm-1评估板上实测
-  * esp32的sdk idf v4.4
+  * esp32，该项目在MH-ET LIVE MiniKit for ESP32板上实测(https://doc.riot-os.org/group__boards__esp32__mh-et-live-minikit.html)
+  * esp32的sdk idf v5.2
   * 手机app Siliconlabs efr connect（efr connect ota只支持传输.gbl的固件形式，因此待升级的esp32的bin文件直接将.bin后缀改为.gbl后就可以使用）
   
  ### 实现方法
