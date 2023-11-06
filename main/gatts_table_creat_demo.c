@@ -52,13 +52,15 @@
 #define BREAK_BLINK_TIMES 3
 
 #define BATTERY_RELAY_GPIO          GPIO_NUM_2
-#define BRACK_RELAY_GPIO            GPIO_NUM_0
+#define BRACK_RELAY_GPIO            GPIO_NUM_4
 #define GPIO_OUTPUT_PIN_SEL         ((1ULL << BATTERY_RELAY_GPIO) | (1ULL << BRACK_RELAY_GPIO))
 
 #define BRACK_STATE_GPIO            GPIO_NUM_5
 #define GPIO_INPUT_PIN_SEL          (1ULL << BRACK_STATE_GPIO)
 
-#define BATTERY_LEVEL_GPIO          GPIO_NUM_4
+#define BATTERY_VOLTAGE_UPDATE_SEC  3600
+#define BATTERY_LEVEL_ADC_CHAN0     ADC_CHANNEL_6
+#define BATTERY_LEVEL_ADC_ATTEN     ADC_ATTEN_DB_11
 
 #define PROFILE_NUM                 1
 #define PROFILE_APP_IDX             0
@@ -89,6 +91,9 @@ static prepare_type_env_t prepare_write_env;
 static bool batteryRelayOn = false;
 static bool brackTigger = false;
 static QueueHandle_t gpio_evt_queue = NULL;
+static int adc_raw[1][10];
+static int voltage[1][10];
+static uint32_t batteryVoltage;
 
 esp_err_t err;
 /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
@@ -739,12 +744,23 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
 static void gpio_task(void* arg)
 {
     uint32_t io_num;
+    bool oldState, newState;
+
+    oldState = true;
+
     for (;;) {
         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            //printf("GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level(io_num));
-            brackTigger = true;
+            ESP_LOGD(GATTS_TABLE_TAG, "GPIO[%"PRIu32"] intr", io_num);
+            if (io_num == BRACK_STATE_GPIO) {
+                newState = gpio_get_level(io_num);
+                ESP_LOGI(GATTS_TABLE_TAG, "GPIO[%"PRIu32"] intr, val: %d", io_num, newState);
+                if (oldState != newState) { //debounce
+                    oldState = newState;
+                    if (oldState == false)
+                        brackTigger = true;
+                }
+            }
         }
-        esp_task_wdt_reset();
     }
 }
 
@@ -753,41 +769,157 @@ bool run_diagnostics() {
     return true;
 }
 
-int loop(void) {
-    int i;
+static void task_battery_relay(void * argp) {
     while (1) {
-        //vTaskDelay(10 / portTICK_PERIOD_MS);
-        if (batteryRelayOn == true)
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+        if (batteryRelayOn)
             gpio_set_level(BATTERY_RELAY_GPIO, 1);
         else
             gpio_set_level(BATTERY_RELAY_GPIO, 0);
+    }
+}
+ 
+static void task_stop_led_relay(void * argp) {
+    int i;
 
-        if (brackTigger == true) {
+    while (1) {
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+        if (brackTigger) {
             brackTigger = false;
             for (i = 0; i < BREAK_BLINK_TIMES; i++) {
                 gpio_set_level(BRACK_RELAY_GPIO, 1);
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-                if (gpio_get_level(BRACK_STATE_GPIO))
-                    goto skip_blink;
                 gpio_set_level(BRACK_RELAY_GPIO, 0);
                 vTaskDelay(100 / portTICK_PERIOD_MS);
+                if (gpio_get_level(BRACK_STATE_GPIO))
+                    i = BREAK_BLINK_TIMES;
             }
+            if (gpio_get_level(BRACK_STATE_GPIO))
+                continue;
             for (i = 0; i < BREAK_BLINK_TIMES; i++) {
                 gpio_set_level(BRACK_RELAY_GPIO, 1);
                 vTaskDelay(300 / portTICK_PERIOD_MS);
-                if (gpio_get_level(BRACK_STATE_GPIO))
-                    goto skip_blink;
                 gpio_set_level(BRACK_RELAY_GPIO, 0);
                 vTaskDelay(300 / portTICK_PERIOD_MS);
+                if (gpio_get_level(BRACK_STATE_GPIO))
+                    i = BREAK_BLINK_TIMES;
             }
+            if (gpio_get_level(BRACK_STATE_GPIO))
+                continue;
             gpio_set_level(BRACK_RELAY_GPIO, 1);
         }
-        if (gpio_get_level(BRACK_STATE_GPIO)) {
-skip_blink:
-            gpio_set_level(BRACK_RELAY_GPIO, 0);
+        else {
+            if (gpio_get_level(BRACK_STATE_GPIO))
+                gpio_set_level(BRACK_RELAY_GPIO, 0);
         }
     }
-    return -1;
+}
+
+/*---------------------------------------------------------------
+        ADC Calibration
+---------------------------------------------------------------*/
+static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
+{
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(GATTS_TABLE_TAG, "calibration scheme version is %s", "Curve Fitting");
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .chan = channel,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(GATTS_TABLE_TAG, "calibration scheme version is %s", "Line Fitting");
+        adc_cali_line_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+    *out_handle = handle;
+    if (ret == ESP_OK) {
+        ESP_LOGI(GATTS_TABLE_TAG, "Calibration Success");
+    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
+        ESP_LOGW(GATTS_TABLE_TAG, "eFuse not burnt, skip software calibration");
+    } else {
+        ESP_LOGE(GATTS_TABLE_TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+
+static void adc_calibration_deinit(adc_cali_handle_t handle)
+{
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    ESP_LOGI(GATTS_TABLE_TAG, "deregister %s calibration scheme", "Curve Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(handle));
+
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    ESP_LOGI(GATTS_TABLE_TAG, "deregister %s calibration scheme", "Line Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle));
+#endif
+}
+
+static void loop(void)
+{
+    int i;
+
+    //-------------ADC1 Init---------------//
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    //-------------ADC1 Config---------------//
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = BATTERY_LEVEL_ADC_ATTEN,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BATTERY_LEVEL_ADC_CHAN0, &config));
+
+    //-------------ADC1 Calibration Init---------------//
+    adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+    bool do_calibration1_chan0 = adc_calibration_init(ADC_UNIT_1, BATTERY_LEVEL_ADC_CHAN0, BATTERY_LEVEL_ADC_ATTEN, &adc1_cali_chan0_handle);
+
+    while (1) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, BATTERY_LEVEL_ADC_CHAN0, &adc_raw[0][0]));
+        ESP_LOGD(GATTS_TABLE_TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, BATTERY_LEVEL_ADC_CHAN0, adc_raw[0][0]);
+        if (do_calibration1_chan0) {
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, adc_raw[0][0], &voltage[0][0]));
+            ESP_LOGD(GATTS_TABLE_TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, BATTERY_LEVEL_ADC_CHAN0, voltage[0][0]);
+            batteryVoltage = voltage[0][0] * 1044 / 44;
+            ESP_LOGI(GATTS_TABLE_TAG, "Battery Voltage: %lu.%lu V", batteryVoltage / 1000, batteryVoltage % 1000);
+        }
+        if (batteryRelayOn == true)
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        else {
+            for (i = 0; i < BATTERY_VOLTAGE_UPDATE_SEC; i++) {
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                if (batteryRelayOn == true)
+                    i = BATTERY_VOLTAGE_UPDATE_SEC;
+            }
+        }
+    }
 }
 
 void app_main(void)
@@ -927,12 +1059,12 @@ void app_main(void)
     io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
     //disable pull-down mode
     io_conf.pull_down_en = 0;
-    //disable pull-up mode
-    io_conf.pull_up_en = 0;
+    //Enable pull-up mode
+    io_conf.pull_up_en = 1;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
-    gpio_set_level(BATTERY_RELAY_GPIO, 0);
-    gpio_set_level(BRACK_RELAY_GPIO, 1);
+    //gpio_set_level(BATTERY_RELAY_GPIO, 0);
+    //gpio_set_level(BRACK_RELAY_GPIO, 1);
 
     //interrupt of rising edge
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
@@ -941,11 +1073,11 @@ void app_main(void)
     //set as input mode
     io_conf.mode = GPIO_MODE_INPUT;
     //enable pull-up mode
-    //io_conf.pull_up_en = 1;
+    io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
 
     //create a queue to handle gpio event from isr
-    gpio_evt_queue = xQueueCreate(5, sizeof(uint32_t));
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     //start gpio task
     xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
 
@@ -956,6 +1088,8 @@ void app_main(void)
 
     ESP_LOGI(GATTS_TABLE_TAG, "Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
-    loop();
+    xTaskCreate(task_battery_relay, "battery_relay", 2048, NULL, 10, NULL);
+    xTaskCreate(task_stop_led_relay, "stop_led_relay", 2048, NULL, 10, NULL);
 
+    loop();
 }
