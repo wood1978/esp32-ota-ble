@@ -22,7 +22,6 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
-#include "esp_task_wdt.h"
 
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
@@ -44,6 +43,9 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
+//for tone
+#include "driver/ledc.h"
+
 #define GATTS_TABLE_TAG "eBIKE"
 #define CONFIG_LOG_MAXIMUM_LEVEL ESP_LOG_VERBOSE
 
@@ -53,10 +55,24 @@
 
 #define BATTERY_RELAY_GPIO          GPIO_NUM_2
 #define BRACK_RELAY_GPIO            GPIO_NUM_4
+
 #define GPIO_OUTPUT_PIN_SEL         ((1ULL << BATTERY_RELAY_GPIO) | (1ULL << BRACK_RELAY_GPIO))
 
+#define SPEAK_GPIO                  GPIO_NUM_25
+#define LEDC_TIMER                  LEDC_TIMER_0
+#define LEDC_MODE                   LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO              (SPEAK_GPIO) // Define the output GPIO
+#define LEDC_CHANNEL                LEDC_CHANNEL_0
+#define LEDC_DUTY_RES               LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
+#define LEDC_DUTY                   (4096) // Set duty to 50%. (2 ** 13) * 50% = 4096
+#define LEDC_FREQUENCY              (200) // Frequency in Hertz. Set frequency at 4 kHz
+#define ALARM_LEVEL_1               100
+#define ALARM_LEVEL_2               500
+#define ALARM_LEVEL_3               1000
+
 #define BRACK_STATE_GPIO            GPIO_NUM_5
-#define GPIO_INPUT_PIN_SEL          (1ULL << BRACK_STATE_GPIO)
+#define SHAKE_STATE_GPIO            GPIO_NUM_33
+#define GPIO_INPUT_PIN_SEL          ((1ULL << BRACK_STATE_GPIO) | (1ULL << SHAKE_STATE_GPIO))
 
 #define BATTERY_VOLTAGE_UPDATE_SEC  3600
 #define BATTERY_LEVEL_ADC_CHAN0     ADC_CHANNEL_6
@@ -90,10 +106,11 @@ typedef struct {
 static prepare_type_env_t prepare_write_env;
 static bool batteryRelayOn = false;
 static bool brackTigger = false;
-static QueueHandle_t gpio_evt_queue = NULL;
+static int shakeCounter = 0;
 static int adc_raw[1][10];
 static int voltage[1][10];
 static uint32_t batteryVoltage;
+static QueueHandle_t gpio_evt_queue = NULL;
 
 esp_err_t err;
 /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
@@ -753,11 +770,17 @@ static void gpio_task(void* arg)
             ESP_LOGD(GATTS_TABLE_TAG, "GPIO[%"PRIu32"] intr", io_num);
             if (io_num == BRACK_STATE_GPIO) {
                 newState = gpio_get_level(io_num);
-                ESP_LOGI(GATTS_TABLE_TAG, "GPIO[%"PRIu32"] intr, val: %d", io_num, newState);
+                ESP_LOGD(GATTS_TABLE_TAG, "GPIO[%"PRIu32"] intr, val: %d", io_num, newState);
                 if (oldState != newState) { //debounce
                     oldState = newState;
                     if (oldState == false)
                         brackTigger = true;
+                }
+            }
+            else if (io_num == SHAKE_STATE_GPIO) {
+                if (batteryRelayOn == false) {
+                    if (shakeCounter < 0x1800)
+                        shakeCounter+=100;
                 }
             }
         }
@@ -811,6 +834,115 @@ static void task_stop_led_relay(void * argp) {
         else {
             if (gpio_get_level(BRACK_STATE_GPIO))
                 gpio_set_level(BRACK_RELAY_GPIO, 0);
+        }
+    }
+}
+
+static void task_shake_alarm(void *args) {
+    int i = 0, alarmLevel = -1;
+
+    while (1) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        if ((shakeCounter > 0) && (batteryRelayOn == false)) {
+            if (alarmLevel == -1) {
+                if (shakeCounter > ALARM_LEVEL_3)
+                    alarmLevel = 3;
+                else if (shakeCounter > ALARM_LEVEL_2)
+                    alarmLevel = 2;
+                else if (shakeCounter > ALARM_LEVEL_1)
+                    alarmLevel = 1;
+                else
+                    alarmLevel = 0;
+                ESP_LOGD(GATTS_TABLE_TAG, "SC:%d AL:%d", shakeCounter, alarmLevel);
+            }
+            else if (alarmLevel == 0) {
+                if (shakeCounter > ALARM_LEVEL_3)
+                    alarmLevel = 3;
+                else if (shakeCounter > ALARM_LEVEL_2)
+                    alarmLevel = 2;
+                else if (shakeCounter > ALARM_LEVEL_1)
+                    alarmLevel = 1;
+                ESP_LOGD(GATTS_TABLE_TAG, "SC:%d AL:%d", shakeCounter, alarmLevel);
+            }
+            else if (alarmLevel == 1) {
+                if (shakeCounter > ALARM_LEVEL_3)
+                    alarmLevel = 3;
+                else if (shakeCounter > ALARM_LEVEL_2)
+                    alarmLevel = 2;
+                ESP_LOGD(GATTS_TABLE_TAG, "SC:%d AL:%d", shakeCounter, alarmLevel);
+            }
+            else if (alarmLevel == 2) {
+                if (shakeCounter > ALARM_LEVEL_3)
+                    alarmLevel = 3;
+                ESP_LOGD(GATTS_TABLE_TAG, "SC:%d AL:%d", shakeCounter, alarmLevel);
+            }
+            ESP_LOGI(GATTS_TABLE_TAG, "SC:%d AL:%d", shakeCounter, alarmLevel);
+            switch (alarmLevel) {
+                case 3:
+                    if (i < 1) {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 988)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 988);
+                    }
+                    else {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 1976)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 1976);
+                    }
+                    if (i < 2)
+                        i+=1;
+                    else
+                        i = 0;
+                    break;
+
+                case 2:
+                    if (i < 3) {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 494)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 494);
+                    }
+                    else {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 988)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 988);
+                    }
+                    if (i < 6)
+                        i+=1;
+                    else
+                        i = 0;
+                    break;
+
+                case 1:
+                    if (i < 6) {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 247)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 247);
+                    }
+                    else {
+                        if (ledc_get_freq(LEDC_MODE, LEDC_TIMER) != 494)
+                            ledc_set_freq(LEDC_MODE, LEDC_TIMER, 494);
+                    }
+                    if (i < 12)
+                        i+=1;
+                    else
+                        i = 0;
+                    break;
+
+                default:
+                    break;
+            }
+            
+            if (alarmLevel > 0) {
+                if (ledc_get_duty(LEDC_MODE, LEDC_CHANNEL) == 0) {
+                    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
+                    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+                }
+            }
+            shakeCounter--;
+        }
+        else {
+            i = 0;
+            alarmLevel = -1;
+            shakeCounter = 0;
+            if (ledc_get_duty(LEDC_MODE, LEDC_CHANNEL) > 0) {
+                ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
+                ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+            }
         }
     }
 }
@@ -1026,7 +1158,7 @@ void app_main(void)
     uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
     uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
     //set static passkey
-    uint32_t passkey = 123456;
+    uint32_t passkey = 661008;
     uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
     uint8_t oob_support = ESP_BLE_OOB_DISABLE;
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t));
@@ -1063,8 +1195,6 @@ void app_main(void)
     io_conf.pull_up_en = 1;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
-    //gpio_set_level(BATTERY_RELAY_GPIO, 0);
-    //gpio_set_level(BRACK_RELAY_GPIO, 1);
 
     //interrupt of rising edge
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
@@ -1072,8 +1202,8 @@ void app_main(void)
     io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
     //set as input mode
     io_conf.mode = GPIO_MODE_INPUT;
-    //enable pull-up mode
-    io_conf.pull_up_en = 1;
+    //Disable pull-up mode
+    io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
 
     //create a queue to handle gpio event from isr
@@ -1085,11 +1215,35 @@ void app_main(void)
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     //hook isr handler for specific gpio pin
     gpio_isr_handler_add(BRACK_STATE_GPIO, gpio_isr_handler, (void*)BRACK_STATE_GPIO);
+    gpio_isr_handler_add(SHAKE_STATE_GPIO, gpio_isr_handler, (void*)SHAKE_STATE_GPIO);
+
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .timer_num        = LEDC_TIMER,
+        .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 4 kHz
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = LEDC_OUTPUT_IO,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
     ESP_LOGI(GATTS_TABLE_TAG, "Minimum free heap size: %"PRIu32" bytes\n", esp_get_minimum_free_heap_size());
 
     xTaskCreate(task_battery_relay, "battery_relay", 2048, NULL, 10, NULL);
     xTaskCreate(task_stop_led_relay, "stop_led_relay", 2048, NULL, 10, NULL);
+    xTaskCreate(task_shake_alarm, "shake_alarm", 2048, NULL, 10, NULL);
 
     loop();
 }
