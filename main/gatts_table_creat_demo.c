@@ -67,8 +67,8 @@
 #define LEDC_DUTY                   (4096) // Set duty to 50%. (2 ** 13) * 50% = 4096
 #define LEDC_FREQUENCY              (200) // Frequency in Hertz. Set frequency at 4 kHz
 #define ALARM_LEVEL_1               100
-#define ALARM_LEVEL_2               500
-#define ALARM_LEVEL_3               1000
+#define ALARM_LEVEL_2               200
+#define ALARM_LEVEL_3               400
 
 #define BRACK_STATE_GPIO            GPIO_NUM_5
 #define SHAKE_STATE_GPIO            GPIO_NUM_33
@@ -779,8 +779,10 @@ static void gpio_task(void* arg)
             }
             else if (io_num == SHAKE_STATE_GPIO) {
                 if (batteryRelayOn == false) {
-                    if (shakeCounter < 0x1800)
-                        shakeCounter+=100;
+                    if (shakeCounter == 0)
+                        shakeCounter += 100;
+                    else if (shakeCounter < 0x1800)
+                        shakeCounter += 10;
                 }
             }
         }
@@ -1158,7 +1160,7 @@ void app_main(void)
     uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
     uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
     //set static passkey
-    uint32_t passkey = 661008;
+    uint32_t passkey = 123456;
     uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
     uint8_t oob_support = ESP_BLE_OOB_DISABLE;
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t));
